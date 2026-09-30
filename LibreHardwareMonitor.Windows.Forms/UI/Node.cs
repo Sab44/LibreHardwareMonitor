@@ -12,6 +12,8 @@ namespace LibreHardwareMonitor.Windows.Forms.UI;
 
 public class Node
 {
+    private static readonly object _syncRoot = new();
+
     private Node _parent;
     private readonly NodeCollection _nodes;
     private string _text;
@@ -42,6 +44,11 @@ public class Node
         _nodes = new NodeCollection(this);
         _visible = true;
     }
+
+    /// <summary>
+    /// Guards structural changes of all node collections, so that the tree can be walked safely from other threads (e.g. the web server).
+    /// </summary>
+    public static object SyncRoot => _syncRoot;
 
     public TreeModel Model { get; set; }
 
@@ -137,7 +144,11 @@ public class Node
             {
                 item._parent?._nodes.Remove(item);
                 item._parent = _owner;
-                base.InsertItem(index, item);
+
+                lock (_syncRoot)
+                {
+                    base.InsertItem(index, item);
+                }
 
                 TreeModel model = _owner.RootTreeModel();
                 model?.OnStructureChanged(_owner);
@@ -149,7 +160,11 @@ public class Node
         {
             Node item = this[index];
             item._parent = null;
-            base.RemoveItem(index);
+
+            lock (_syncRoot)
+            {
+                base.RemoveItem(index);
+            }
 
             TreeModel model = _owner.RootTreeModel();
             model?.OnStructureChanged(_owner);

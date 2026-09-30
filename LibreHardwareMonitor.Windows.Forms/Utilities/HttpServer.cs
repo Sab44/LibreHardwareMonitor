@@ -31,6 +31,9 @@ public class HttpServer
     private readonly Node _root;
     private readonly IElement _rootElement;
     private readonly Version _version = typeof(HttpServer).Assembly.GetName().Version;
+    private readonly ManualResetEventSlim _treeReady = new(true);
+
+    private static readonly TimeSpan TreeRebuildTimeout = TimeSpan.FromSeconds(10);
 
     private Task _listenerTask;
     private CancellationTokenSource _cts;
@@ -88,6 +91,36 @@ public class HttpServer
 
     public string PasswordSHA256 { get; set; }
 
+    /// <summary>
+    /// Holds back requests that read the hardware tree until <see cref="EndTreeRebuild" /> is called,
+    /// so that clients never see the partially rebuilt tree (e.g. while the computer is reset).
+    /// </summary>
+    public void BeginTreeRebuild()
+    {
+        _treeReady.Reset();
+    }
+
+    public void EndTreeRebuild()
+    {
+        _treeReady.Set();
+    }
+
+    private T ReadTree<T>(Func<T> read)
+    {
+        while (true)
+        {
+            if (!_treeReady.Wait(TreeRebuildTimeout))
+                throw new TimeoutException("Timed out waiting for the hardware tree to be rebuilt.");
+
+            lock (Node.SyncRoot)
+            {
+                // A rebuild may have started between the wait and acquiring the lock.
+                if (_treeReady.IsSet)
+                    return read();
+            }
+        }
+    }
+
     public bool StartHttpListener()
     {
         if (PlatformNotSupported)
@@ -143,8 +176,9 @@ public class HttpServer
         try
         {
             _cts?.Cancel();
-            _listenerTask?.Wait(TimeSpan.FromSeconds(5)); // Graceful wait
+            // Stop the listener first, GetContextAsync cannot be cancelled and would otherwise block until the timeout.
             _listener?.Stop();
+            _listenerTask?.Wait(TimeSpan.FromSeconds(5)); // Graceful wait
             _cts?.Dispose();
         }
         catch (HttpListenerException)
@@ -260,7 +294,7 @@ public class HttpServer
         {
             if (dict.ContainsKey("id"))
             {
-                SensorNode sNode = FindSensor(_root, dict["id"]);
+                SensorNode sNode = ReadTree(() => FindSensor(_root, dict["id"]));
 
                 if (sNode == null)
                 {
@@ -521,9 +555,7 @@ public class HttpServer
     {
         Dictionary<string, object> json = new();
 
-        int nodeIndex = 0;
-
-        json["id"] = nodeIndex++;
+        json["id"] = 0;
         json["Version"] = $"{_version.Major}.{_version.Minor}.{_version.Build}";
         json["Text"] = "Sensor";
         json["Min"] = "Min";
@@ -531,7 +563,14 @@ public class HttpServer
         json["Max"] = "Max";
         json["ImageURL"] = string.Empty;
 
-        json["Children"] = new List<object> { GenerateJsonForNode(_root, ref nodeIndex) };
+        json["Children"] = new List<object>
+        {
+            ReadTree(() =>
+            {
+                int nodeIndex = 1;
+                return GenerateJsonForNode(_root, ref nodeIndex);
+            })
+        };
 
         byte[] buffer = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(
             json,
@@ -717,13 +756,13 @@ public class HttpServer
         if (request != null && request.QueryString != null && request.QueryString.Count > 0)
         {
             int archive = 0, timestamps = 0, lastvalue = 1;
-            
+
             foreach (string key in request.QueryString.AllKeys)
             {
                 switch (key)
                 {
                     case "timestamps":
-                        int.TryParse(request.QueryString[key], out timestamps);     
+                        int.TryParse(request.QueryString[key], out timestamps);
 
                         if (timestamps < 0 || timestamps > 1)
                             timestamps = 0;     // Enforce boolean range 0 to 1
@@ -767,7 +806,7 @@ public class HttpServer
             prometheusSettings["lastvalue"] = lastvalue;
         }
 
-        string responseContent = GeneratePrometheusResponse(_root, prometheusSettings);
+        string responseContent = ReadTree(() => GeneratePrometheusResponse(_root, prometheusSettings));
         response.AddHeader("Cache-Control", "no-cache");
         response.AddHeader("Access-Control-Allow-Origin", "*");
 
@@ -787,7 +826,7 @@ public class HttpServer
         response.AddHeader("Access-Control-Allow-Origin", "*");
         await SendResponseAsync(response, responseContent, "application/json");
     }
-        
+
     private Dictionary<string, object> GenerateJsonForNode(Node n, ref int nodeIndex)
     {
         Dictionary<string, object> jsonNode = new()

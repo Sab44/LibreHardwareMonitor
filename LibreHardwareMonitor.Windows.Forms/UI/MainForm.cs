@@ -554,10 +554,11 @@ public sealed partial class MainForm : Form
         // Make sure the settings are saved when the user logs off
         Microsoft.Win32.SystemEvents.SessionEnded += delegate
         {
-            _computer.Close();
-            SaveConfiguration();
+            // Stop the web server first, otherwise it serves the partial tree while the hardware is closed
             if (_runWebServer.Value)
                 Server.Quit();
+            _computer.Close();
+            SaveConfiguration();
         };
 
         Microsoft.Win32.SystemEvents.PowerModeChanged += PowerModeChanged;
@@ -596,7 +597,20 @@ public sealed partial class MainForm : Form
     {
         if (eventArgs.Mode == Microsoft.Win32.PowerModes.Resume)
         {
+            ResetComputer();
+        }
+    }
+
+    private void ResetComputer()
+    {
+        Server.BeginTreeRebuild();
+        try
+        {
             _computer.Reset();
+        }
+        finally
+        {
+            Server.EndTreeRebuild();
         }
     }
 
@@ -1052,10 +1066,11 @@ public sealed partial class MainForm : Form
         Visible = false;
         _systemTray.IsMainIconEnabled = false;
         timer.Enabled = false;
-        _computer.Close();
-        SaveConfiguration();
+        // Stop the web server first, otherwise it serves the partial tree while the hardware is closed
         if (_runWebServer.Value)
             Server.Quit();
+        _computer.Close();
+        SaveConfiguration();
 
         _systemTray.Dispose();
         timer.Dispose();
@@ -1361,7 +1376,7 @@ public sealed partial class MainForm : Form
         // disable the fallback MainIcon during reset, otherwise icon visibility
         // might be lost
         _systemTray.IsMainIconEnabled = false;
-        _computer.Reset();
+        ResetComputer();
         // restore the MainIcon setting
         _systemTray.IsMainIconEnabled = _minimizeToTray.Value;
     }
